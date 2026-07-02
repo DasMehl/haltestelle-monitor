@@ -1,8 +1,11 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
@@ -20,9 +23,19 @@ constexpr uint8_t PIN_TOUCH_MISO = 39;
 constexpr uint8_t PIN_TOUCH_SCLK = 25;
 
 constexpr const char *WIFI_SETUP_AP_NAME = "HaltestelleMonitor-Setup";
-constexpr const char *STOP_LABEL = "Steinstr./Koenigsallee";
-constexpr const char *STOP_ID = "20018234";
+constexpr const char *DEFAULT_STOP_LABEL = "Steinstr./Koenigsallee";
+constexpr const char *DEFAULT_STOP_ID = "20018234";
 constexpr const char *VRR_DM_URL = "https://openservice-test.vrr.de/static03/XML_DM_REQUEST";
+constexpr const char *VRR_STOPFINDER_URL =
+    "https://openservice-test.vrr.de/static03/XML_STOPFINDER_REQUEST";
+
+constexpr const char *PORTAL_CUSTOM_CSS =
+    "<style>"
+    "div>a[href='#p']{display:block;box-sizing:border-box;width:100%;padding:14px 16px;"
+    "margin:0 0 10px 0;border-radius:10px;background:#f0f0f0;color:#111;font-size:18px;"
+    "font-weight:600;}"
+    "div>a[href='#p']:active{background:#dcdcdc;}"
+    "</style>";
 
 constexpr uint16_t SCREEN_W = 320;
 constexpr uint16_t SCREEN_H = 240;
@@ -42,7 +55,6 @@ constexpr uint16_t COLOR_MUTED = 0x7BEF;
 constexpr uint16_t COLOR_TRAM = 0xFEE0;
 constexpr uint16_t COLOR_UBAHN = 0x44BF;
 constexpr uint16_t COLOR_WARN = 0xFDF0;
-constexpr uint16_t COLOR_RED_DARK = 0x4000;
 
 struct Departure {
   char line[8];
@@ -80,10 +92,27 @@ uint32_t lastHeaderRefreshAt = 0;
 uint32_t lastTickerShiftAt = 0;
 uint32_t lastWifiRetryAt = 0;
 uint32_t lastDataRefreshAt = 0;
+uint32_t stopChangeRequestedAt = 0;
 int lastAppliedElapsedMinutes = -1;
 
 SemaphoreHandle_t dataMutex = nullptr;
+SemaphoreHandle_t networkMutex = nullptr;
 volatile bool dataDirty = false;
+
+struct MutexGuard {
+  SemaphoreHandle_t sem;
+  explicit MutexGuard(SemaphoreHandle_t s) : sem(s) { xSemaphoreTake(sem, portMAX_DELAY); }
+  ~MutexGuard() { xSemaphoreGive(sem); }
+};
+
+char tramStopId[16];
+char tramStopLabel[64];
+char ubahnStopId[16];
+char ubahnStopLabel[64];
+
+constexpr const char *STOP_SETUP_HOSTNAME = "haltestelle";
+WebServer stopServer(80);
+bool stopServerRunning = false;
 
 struct Rect {
   int16_t x;
@@ -151,12 +180,52 @@ void markDataUpdated() {
   lastDataRefreshAt = lastUpdateAt;
 }
 
+void loadStopConfig() {
+  Preferences prefs;
+  prefs.begin("haltmon", true);
+  String savedTramId = prefs.getString("tramStopId", DEFAULT_STOP_ID);
+  String savedTramLabel = prefs.getString("tramStopLabel", DEFAULT_STOP_LABEL);
+  String savedUbahnId = prefs.getString("ubahnStopId", DEFAULT_STOP_ID);
+  String savedUbahnLabel = prefs.getString("ubahnStopLabel", DEFAULT_STOP_LABEL);
+  prefs.end();
+  copyText(tramStopId, sizeof(tramStopId), savedTramId.c_str());
+  copyText(tramStopLabel, sizeof(tramStopLabel), savedTramLabel.c_str());
+  copyText(ubahnStopId, sizeof(ubahnStopId), savedUbahnId.c_str());
+  copyText(ubahnStopLabel, sizeof(ubahnStopLabel), savedUbahnLabel.c_str());
+}
+
+void saveStopConfig() {
+  Preferences prefs;
+  prefs.begin("haltmon", false);
+  prefs.putString("tramStopId", tramStopId);
+  prefs.putString("tramStopLabel", tramStopLabel);
+  prefs.putString("ubahnStopId", ubahnStopId);
+  prefs.putString("ubahnStopLabel", ubahnStopLabel);
+  prefs.end();
+}
+
 DirectionView snapshotActiveView() {
   DirectionView copy{};
   xSemaphoreTake(dataMutex, portMAX_DELAY);
   copy = modeViews[activeMode].directions[activeDirection];
   xSemaphoreGive(dataMutex);
   return copy;
+}
+
+void drawSetupStatus(const char *line1, const char *line2 = nullptr, const char *line3 = nullptr,
+                      const char *line4 = nullptr) {
+  tft.fillScreen(COLOR_BG);
+  tft.setTextDatum(MC_DATUM);
+  int y = SCREEN_H / 2 - 30;
+  const char *lines[4] = {line1, line2, line3, line4};
+  for (const char *line : lines) {
+    if (!line) {
+      continue;
+    }
+    tft.setTextColor(line == line1 ? COLOR_TEXT : COLOR_MUTED, COLOR_BG);
+    tft.drawString(line, SCREEN_W / 2, y, line == line1 ? 2 : 1);
+    y += line == line1 ? 26 : 18;
+  }
 }
 
 void drawRoundedPanel(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t fill) {
@@ -185,16 +254,14 @@ void drawHeaderStatus() {
   constexpr int dotX = 244;
   constexpr int stampRight = 312;
   tft.fillRect(232, 4, 82, 18, COLOR_BG);
-  uint16_t dotColor = COLOR_RED_DARK;
+  uint16_t dotColor = COLOR_MUTED;
   if (ageMs < DATA_REFRESH_INTERVAL_MS * 2) {
-    uint32_t phase = millis() % 2000;
-    uint8_t pulse = phase < 1000 ? phase / 20 : (2000 - phase) / 20;
-    uint8_t r = 10 + pulse;
-    uint8_t g = pulse / 10;
-    uint8_t b = pulse / 12;
-    dotColor = tft.color565(r, g, b);
+    uint32_t phase = millis() % 1600;
+    uint8_t pulse = phase < 800 ? (phase * 255) / 800 : ((1600 - phase) * 255) / 800;
+    uint8_t g = 90 + (pulse * 165 / 255);
+    dotColor = tft.color565(20, g, 60);
   }
-  tft.fillCircle(dotX, statusY, 3, dotColor);
+  tft.fillCircle(dotX, statusY, 4, dotColor);
   tft.setTextColor(COLOR_MUTED, COLOR_BG);
   tft.setTextDatum(TR_DATUM);
   if (showLive) {
@@ -205,13 +272,24 @@ void drawHeaderStatus() {
 }
 
 void drawHeader() {
+  const char *activeStopLabel = activeMode == 0 ? tramStopLabel : ubahnStopLabel;
   tft.setTextColor(COLOR_TEXT, COLOR_BG);
   tft.setTextDatum(TL_DATUM);
-  tft.fillRect(0, 0, 258, 28, COLOR_BG);
-  tft.drawString(STOP_LABEL, 10, 10, 2);
-  tft.drawString(STOP_LABEL, 11, 10, 2);
-  tft.drawString(STOP_LABEL, 10, 11, 2);
-  tft.drawString(STOP_LABEL, 11, 11, 2);
+  tft.fillRect(0, 0, SCREEN_W, 28, COLOR_BG);
+
+  constexpr int labelMaxWidth = 214;
+  String label = activeStopLabel;
+  while (label.length() > 0 && tft.textWidth(label + "...", 2) > labelMaxWidth) {
+    label.remove(label.length() - 1);
+  }
+  if (label != activeStopLabel) {
+    label += "...";
+  }
+
+  tft.drawString(label, 10, 10, 2);
+  tft.drawString(label, 11, 10, 2);
+  tft.drawString(label, 10, 11, 2);
+  tft.drawString(label, 11, 11, 2);
   drawHeaderStatus();
 }
 
@@ -437,10 +515,12 @@ bool appendDeparture(DirectionView &view, JsonVariantConst departure) {
   return insertAt >= 0;
 }
 
-bool fetchLiveData() {
-  if (WiFi.status() != WL_CONNECTED) {
+bool fetchStopDepartures(const char *stopIdForRequest, int modeIndex) {
+  if (!stopIdForRequest[0]) {
     return false;
   }
+
+  MutexGuard networkLock(networkMutex);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -449,7 +529,7 @@ bool fetchLiveData() {
   String url = String(VRR_DM_URL) +
                "?language=de&outputFormat=JSON&coordOutputFormat=WGS84%5BDD.ddddd%5D"
                "&type_dm=stop&name_dm=" +
-               STOP_ID + "&mode=direct&useRealtime=1&limit=40";
+               stopIdForRequest + "&mode=direct&useRealtime=1&limit=40";
 
   http.useHTTP10(true);
   http.setTimeout(15000);
@@ -468,8 +548,7 @@ bool fetchLiveData() {
   }
 
   DynamicJsonDocument doc(98304);
-  WiFiClient *stream = http.getStreamPtr();
-  DeserializationError error = deserializeJson(doc, *stream);
+  DeserializationError error = deserializeJson(doc, *http.getStreamPtr());
   int contentLength = http.getSize();
   http.end();
   if (error) {
@@ -479,21 +558,20 @@ bool fetchLiveData() {
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
-  clearLiveData();
+  clearDirectionView(modeViews[modeIndex].directions[0]);
+  clearDirectionView(modeViews[modeIndex].directions[1]);
 
   const char *stopInfoText = firstInfoText(doc["dm"]["points"]["point"]["infos"]);
   if (stopInfoText && stopInfoText[0]) {
-    for (ModeView &mode : modeViews) {
-      for (DirectionView &direction : mode.directions) {
-        copyText(direction.liveHint, sizeof(direction.liveHint), stopInfoText);
-      }
-    }
+    copyText(modeViews[modeIndex].directions[0].liveHint,
+             sizeof(modeViews[modeIndex].directions[0].liveHint), stopInfoText);
+    copyText(modeViews[modeIndex].directions[1].liveHint,
+             sizeof(modeViews[modeIndex].directions[1].liveHint), stopInfoText);
   }
 
   JsonArrayConst departures = doc["departureList"].as<JsonArrayConst>();
   for (JsonVariantConst departure : departures) {
-    int modeIndex = modeIndexForDeparture(departure);
-    if (modeIndex < 0) {
+    if (modeIndexForDeparture(departure) != modeIndex) {
       continue;
     }
 
@@ -501,12 +579,300 @@ bool fetchLiveData() {
     appendDeparture(modeViews[modeIndex].directions[directionIndex], departure);
   }
 
+  xSemaphoreGive(dataMutex);
+  return true;
+}
+
+bool fetchLiveData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  char tramIdSnapshot[16];
+  char ubahnIdSnapshot[16];
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  strncpy(tramIdSnapshot, tramStopId, sizeof(tramIdSnapshot));
+  strncpy(ubahnIdSnapshot, ubahnStopId, sizeof(ubahnIdSnapshot));
+  xSemaphoreGive(dataMutex);
+
+  bool tramOk = fetchStopDepartures(tramIdSnapshot, 0);
+  bool ubahnOk = fetchStopDepartures(ubahnIdSnapshot, 1);
+
+  if (!tramOk && !ubahnOk) {
+    return false;
+  }
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
   markDataUpdated();
   xSemaphoreGive(dataMutex);
 
   dataDirty = true;
-  Serial.println("Live departure data updated from VRR");
+  Serial.printf("Live departure data updated (tram=%s, ubahn=%s)\n", tramOk ? "ok" : "fail",
+                ubahnOk ? "ok" : "fail");
   return true;
+}
+
+String urlEncode(const char *value) {
+  String encoded;
+  char buf[4];
+  for (const char *p = value; *p; ++p) {
+    unsigned char c = static_cast<unsigned char>(*p);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else if (c == ' ') {
+      encoded += '+';
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+
+struct StopCandidate {
+  char id[16];
+  char name[64];
+};
+
+int searchStops(const char *query, StopCandidate *results, int maxResults) {
+  if (WiFi.status() != WL_CONNECTED || !query || !query[0]) {
+    return 0;
+  }
+
+  MutexGuard networkLock(networkMutex);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(VRR_STOPFINDER_URL) +
+               "?language=de&outputFormat=JSON&type_sf=stop&anyObjFilter_sf=2&name_sf=" +
+               urlEncode(query);
+
+  http.useHTTP10(true);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, url)) {
+    Serial.println("Stop search: HTTP begin failed");
+    return 0;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("Stop search: HTTP GET failed: %d\n", httpCode);
+    http.end();
+    return 0;
+  }
+
+  DynamicJsonDocument doc(16384);
+  DeserializationError error = deserializeJson(doc, *http.getStreamPtr());
+  http.end();
+  if (error) {
+    Serial.printf("Stop search: JSON parse failed: %s\n", error.c_str());
+    return 0;
+  }
+
+  JsonVariantConst pointsNode = doc["stopFinder"]["points"];
+  int count = 0;
+
+  auto addPoint = [&](JsonVariantConst point) {
+    if (count >= maxResults) {
+      return;
+    }
+    const char *id = point["stateless"] | "";
+    const char *name = point["name"] | "";
+    if (!id[0]) {
+      return;
+    }
+    copyText(results[count].id, sizeof(results[count].id), id);
+    copyText(results[count].name, sizeof(results[count].name), name);
+    ++count;
+  };
+
+  if (pointsNode.is<JsonArrayConst>()) {
+    for (JsonVariantConst p : pointsNode.as<JsonArrayConst>()) {
+      if (count >= maxResults) {
+        break;
+      }
+      addPoint(p);
+    }
+  } else if (pointsNode.is<JsonObjectConst>()) {
+    JsonVariantConst inner = pointsNode["point"];
+    if (inner.is<JsonArrayConst>()) {
+      for (JsonVariantConst p : inner.as<JsonArrayConst>()) {
+        if (count >= maxResults) {
+          break;
+        }
+        addPoint(p);
+      }
+    } else if (inner.is<JsonObjectConst>()) {
+      addPoint(inner);
+    }
+  }
+
+  return count;
+}
+
+void handleStopRoot() {
+  String page =
+      "<!doctype html><html><head><meta name='viewport' content='width=device-width,"
+      "initial-scale=1'><meta charset='utf-8'><title>Haltestelle</title><style>"
+      "body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px;color:#222;}"
+      "input{width:100%;padding:12px;font-size:18px;box-sizing:border-box;margin:8px 0;}"
+      "button{width:100%;padding:14px;font-size:18px;background:#1fa3ec;color:#fff;border:0;"
+      "border-radius:8px;}"
+      ".status{color:#2a2;font-weight:bold;}"
+      ".section{margin-bottom:32px;padding-bottom:16px;border-bottom:1px solid #ddd;}"
+      ".result{display:block;width:100%;box-sizing:border-box;padding:12px 14px;margin:6px 0;"
+      "border-radius:8px;background:#f0f0f0;color:#111;text-align:left;border:0;font-size:16px;}"
+      ".result:active{background:#dcdcdc;}"
+      ".saved{color:#2a2;font-weight:bold;}"
+      "</style></head><body>"
+      "<p class='status'>WLAN: verbunden</p>"
+
+      "<div class='section'>"
+      "<h2>Strassenbahn</h2>"
+      "<p>Aktuell: <b id='tram-current'>" +
+      String(tramStopLabel) +
+      "</b></p>"
+      "<input id='tram-q' placeholder='Haltestelle suchen...'>"
+      "<button onclick=\"doSearch('tram')\">Suchen</button>"
+      "<div id='tram-results'></div>"
+      "</div>"
+
+      "<div class='section'>"
+      "<h2>U-Bahn</h2>"
+      "<p>Aktuell: <b id='ubahn-current'>" +
+      String(ubahnStopLabel) +
+      "</b></p>"
+      "<input id='ubahn-q' placeholder='Haltestelle suchen...'>"
+      "<button onclick=\"doSearch('ubahn')\">Suchen</button>"
+      "<div id='ubahn-results'></div>"
+      "</div>"
+
+      "<script>"
+      "function doSearch(mode){"
+      "var q=document.getElementById(mode+'-q').value;"
+      "fetch('/search?q='+encodeURIComponent(q)).then(function(r){return r.json();})"
+      ".then(function(list){"
+      "var el=document.getElementById(mode+'-results');"
+      "el.innerHTML='';"
+      "if(list.length===0){el.innerHTML='<p>Keine Treffer</p>';return;}"
+      "list.forEach(function(item){"
+      "var btn=document.createElement('button');"
+      "btn.className='result';"
+      "btn.textContent=item.name;"
+      "btn.onclick=function(){selectStop(mode,item.id,item.name);};"
+      "el.appendChild(btn);"
+      "});"
+      "});"
+      "}"
+      "function pollStatus(el,tries){"
+      "fetch('/status').then(function(r){return r.json();}).then(function(s){"
+      "if(s.updated){"
+      "el.innerHTML=\"<p class='saved'>Gespeichert und aktualisiert!</p>\";"
+      "}else if(tries<10){"
+      "setTimeout(function(){pollStatus(el,tries+1);},700);"
+      "}else{"
+      "el.innerHTML=\"<p class='saved'>Gespeichert (Update dauert laenger als erwartet)</p>\";"
+      "}"
+      "});"
+      "}"
+      "function selectStop(mode,id,name){"
+      "var body='mode='+encodeURIComponent(mode)+'&id='+encodeURIComponent(id)"
+      "+'&label='+encodeURIComponent(name);"
+      "var el=document.getElementById(mode+'-results');"
+      "el.innerHTML='<p>Wird gespeichert...</p>';"
+      "fetch('/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+      "body:body}).then(function(){"
+      "document.getElementById(mode+'-current').textContent=name;"
+      "el.innerHTML='<p>Wird aktualisiert...</p>';"
+      "setTimeout(function(){pollStatus(el,0);},500);"
+      "});"
+      "}"
+      "</script>"
+      "</body></html>";
+  stopServer.send(200, "text/html; charset=utf-8", page);
+}
+
+void handleStopSearch() {
+  String query = stopServer.arg("q");
+  query.trim();
+
+  StopCandidate results[8];
+  int count = query.length() > 0 ? searchStops(query.c_str(), results, 8) : 0;
+
+  String json = "[";
+  for (int i = 0; i < count; ++i) {
+    if (i > 0) {
+      json += ",";
+    }
+    String name = results[i].name;
+    name.replace("\\", "\\\\");
+    name.replace("\"", "\\\"");
+    json += "{\"id\":\"" + String(results[i].id) + "\",\"name\":\"" + name + "\"}";
+  }
+  json += "]";
+  stopServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleStopSet() {
+  String mode = stopServer.arg("mode");
+  String id = stopServer.arg("id");
+  String label = stopServer.arg("label");
+  id.trim();
+  label.trim();
+
+  bool ok = id.length() > 0 && (mode == "tram" || mode == "ubahn");
+  if (ok) {
+    int modeIndex = mode == "tram" ? 0 : 1;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (modeIndex == 0) {
+      copyText(tramStopId, sizeof(tramStopId), id.c_str());
+      copyText(tramStopLabel, sizeof(tramStopLabel), label.c_str());
+    } else {
+      copyText(ubahnStopId, sizeof(ubahnStopId), id.c_str());
+      copyText(ubahnStopLabel, sizeof(ubahnStopLabel), label.c_str());
+    }
+    xSemaphoreGive(dataMutex);
+    saveStopConfig();
+    Serial.printf("%s stop set: %s (ID %s)\n", mode.c_str(), label.c_str(), id.c_str());
+    drawHeader();
+
+    // Signal the background fetch task to refresh immediately instead of
+    // waiting up to DATA_REFRESH_INTERVAL_MS. Deliberately non-blocking here:
+    // the actual network fetch happens on fetchTaskLoop's core, not this
+    // request handler, so the UI never freezes while it runs.
+    stopChangeRequestedAt = millis();
+    lastDataRefreshAt = 0;
+
+    stopServer.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+  } else {
+    stopServer.send(400, "application/json; charset=utf-8", "{\"ok\":false}");
+  }
+}
+
+void handleStopStatus() {
+  bool updated = lastDataRefreshAt != 0 && lastDataRefreshAt >= stopChangeRequestedAt;
+  String json = String("{\"updated\":") + (updated ? "true" : "false") + "}";
+  stopServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void startStopServer() {
+  if (MDNS.begin(STOP_SETUP_HOSTNAME)) {
+    Serial.printf("mDNS started: http://%s.local\n", STOP_SETUP_HOSTNAME);
+  } else {
+    Serial.println("mDNS start failed");
+  }
+  stopServer.on("/", HTTP_GET, handleStopRoot);
+  stopServer.on("/search", HTTP_GET, handleStopSearch);
+  stopServer.on("/set", HTTP_POST, handleStopSet);
+  stopServer.on("/status", HTTP_GET, handleStopStatus);
+  stopServer.begin();
+  stopServerRunning = true;
+  Serial.println("Stop-selector web server started");
 }
 
 void fetchTaskLoop(void *) {
@@ -520,13 +886,14 @@ void fetchTaskLoop(void *) {
   }
 }
 
-void connectWifi(bool forceSetupPortal) {
+bool connectWifi(bool forceSetupPortal) {
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
 
   WiFiManager wifiManager;
   wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_MS / 1000);
-  wifiManager.setConfigPortalTimeout(180);
+  wifiManager.setConfigPortalTimeout(600);
+  wifiManager.setCustomHeadElement(PORTAL_CUSTOM_CSS);
 
   bool connected;
   if (forceSetupPortal) {
@@ -543,6 +910,7 @@ void connectWifi(bool forceSetupPortal) {
   } else {
     Serial.println("WiFi connect/setup portal timed out");
   }
+  return connected;
 }
 
 void maintainWifi() {
@@ -654,6 +1022,7 @@ void setup() {
   delay(300);
 
   clearLiveData();
+  loadStopConfig();
 
   pinMode(PIN_LCD_BL, OUTPUT);
   digitalWrite(PIN_LCD_BL, HIGH);
@@ -673,9 +1042,25 @@ void setup() {
   if (forceWifiSetup) {
     Serial.println("Touch held at boot: forcing WiFi setup portal");
   }
-  connectWifi(forceWifiSetup);
 
+  drawSetupStatus("Schritt 1: WLAN", "Nicht verbunden",
+                   "Falls noetig, verbinde dich mit WLAN:", WIFI_SETUP_AP_NAME);
+  bool wifiConnected = connectWifi(forceWifiSetup);
   dataMutex = xSemaphoreCreateMutex();
+  networkMutex = xSemaphoreCreateMutex();
+
+  if (wifiConnected) {
+    startStopServer();
+    drawSetupStatus("Schritt 2: Haltestelle", "WLAN verbunden",
+                     "Haltestelle waehlen unter:", "http://haltestelle.local");
+    Serial.printf("Stop selector: http://%s.local or http://%s\n", STOP_SETUP_HOSTNAME,
+                  WiFi.localIP().toString().c_str());
+    delay(4000);
+  } else {
+    drawSetupStatus("WLAN fehlgeschlagen", "Bitte neu starten und", "erneut versuchen");
+    delay(3000);
+  }
+
   fetchLiveData();
   renderScreen(true);
   xTaskCreatePinnedToCore(fetchTaskLoop, "fetchTask", 8192, nullptr, 1, nullptr, 0);
@@ -690,4 +1075,7 @@ void loop() {
   maintainWifi();
   checkForNewData();
   updateCountdownIfNeeded();
+  if (stopServerRunning) {
+    stopServer.handleClient();
+  }
 }
