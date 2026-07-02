@@ -5,7 +5,11 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiManager.h>
 #include <XPT2046_Touchscreen.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 namespace {
 constexpr uint8_t PIN_LCD_BL = 21;
@@ -15,8 +19,7 @@ constexpr uint8_t PIN_TOUCH_MOSI = 32;
 constexpr uint8_t PIN_TOUCH_MISO = 39;
 constexpr uint8_t PIN_TOUCH_SCLK = 25;
 
-constexpr const char *WIFI_SSID = "Skynet";
-constexpr const char *WIFI_PASSWORD = "wjohannmehl34";
+constexpr const char *WIFI_SETUP_AP_NAME = "HaltestelleMonitor-Setup";
 constexpr const char *STOP_LABEL = "Steinstr./Koenigsallee";
 constexpr const char *STOP_ID = "20018234";
 constexpr const char *VRR_DM_URL = "https://openservice-test.vrr.de/static03/XML_DM_REQUEST";
@@ -44,7 +47,7 @@ constexpr uint16_t COLOR_RED_DARK = 0x4000;
 struct Departure {
   char line[8];
   char destination[40];
-  int minutes;
+  int minutesAtFetch;
   bool valid;
 };
 
@@ -77,6 +80,10 @@ uint32_t lastHeaderRefreshAt = 0;
 uint32_t lastTickerShiftAt = 0;
 uint32_t lastWifiRetryAt = 0;
 uint32_t lastDataRefreshAt = 0;
+int lastAppliedElapsedMinutes = -1;
+
+SemaphoreHandle_t dataMutex = nullptr;
+volatile bool dataDirty = false;
 
 struct Rect {
   int16_t x;
@@ -125,7 +132,7 @@ void clearDirectionView(DirectionView &view) {
   for (Departure &row : view.rows) {
     copyText(row.line, sizeof(row.line), "--");
     copyText(row.destination, sizeof(row.destination), "");
-    row.minutes = -1;
+    row.minutesAtFetch = -1;
     row.valid = false;
   }
 }
@@ -142,6 +149,14 @@ void markDataUpdated() {
   lastUpdateAt = millis();
   lastHeaderRefreshAt = lastUpdateAt;
   lastDataRefreshAt = lastUpdateAt;
+}
+
+DirectionView snapshotActiveView() {
+  DirectionView copy{};
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  copy = modeViews[activeMode].directions[activeDirection];
+  xSemaphoreGive(dataMutex);
+  return copy;
 }
 
 void drawRoundedPanel(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t fill) {
@@ -216,7 +231,8 @@ void drawTabs() {
 }
 
 void drawRows() {
-  const DirectionView &view = modeViews[activeMode].directions[activeDirection];
+  DirectionView view = snapshotActiveView();
+  uint32_t elapsedMinutes = lastDataRefreshAt == 0 ? 0 : (millis() - lastDataRefreshAt) / 60000;
   drawRoundedPanel(tableArea.x, tableArea.y, tableArea.w, tableArea.h, COLOR_PANEL);
 
   tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
@@ -235,6 +251,7 @@ void drawRows() {
     }
 
     const Departure &row = view.rows[i];
+    int liveMinutes = row.valid ? max(0, row.minutesAtFetch - (int)elapsedMinutes) : -1;
     uint16_t chipColor = activeMode == 0 ? COLOR_TRAM : COLOR_UBAHN;
     tft.fillRoundRect(14, y, 44, 18, 6, chipColor);
     tft.setTextColor(COLOR_BG, chipColor);
@@ -246,11 +263,11 @@ void drawRows() {
     char minutesLabel[8] = "";
     int minutesFont = 4;
     if (row.valid) {
-      if (row.minutes <= 0) {
+      if (liveMinutes <= 0) {
         copyText(minutesLabel, sizeof(minutesLabel), "sofort");
         minutesFont = 2;
       } else {
-        snprintf(minutesLabel, sizeof(minutesLabel), "%d", row.minutes);
+        snprintf(minutesLabel, sizeof(minutesLabel), "%d", liveMinutes);
       }
     }
 
@@ -283,7 +300,7 @@ void drawRows() {
 }
 
 void drawFooter() {
-  const DirectionView &view = modeViews[activeMode].directions[activeDirection];
+  DirectionView view = snapshotActiveView();
   int textWidth = tickerSprite.textWidth(view.liveHint, 2);
   int loopWidth = max(1, textWidth + 24);
   int textX = -(tickerOffset % loopWidth);
@@ -375,12 +392,12 @@ bool appendDeparture(DirectionView &view, JsonVariantConst departure) {
   Departure candidate{};
   copyText(candidate.line, sizeof(candidate.line), departure["servingLine"]["number"] | "--");
   copyText(candidate.destination, sizeof(candidate.destination), departure["servingLine"]["direction"] | "");
-  candidate.minutes = minutesForDeparture(departure);
+  candidate.minutesAtFetch = minutesForDeparture(departure);
   candidate.valid = true;
 
   int insertAt = -1;
   for (int i = 0; i < 4; ++i) {
-    if (!view.rows[i].valid || candidate.minutes < view.rows[i].minutes) {
+    if (!view.rows[i].valid || candidate.minutesAtFetch < view.rows[i].minutesAtFetch) {
       insertAt = i;
       break;
     }
@@ -460,6 +477,8 @@ bool fetchLiveData() {
     return false;
   }
 
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
   clearLiveData();
 
   const char *stopInfoText = firstInfoText(doc["dm"]["points"]["point"]["infos"]);
@@ -483,29 +502,46 @@ bool fetchLiveData() {
   }
 
   markDataUpdated();
+  xSemaphoreGive(dataMutex);
+
+  dataDirty = true;
   Serial.println("Live departure data updated from VRR");
   return true;
 }
 
-void connectWifi() {
-  Serial.printf("Connecting to WiFi SSID \"%s\"...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-    Serial.print(".");
+void fetchTaskLoop(void *) {
+  for (;;) {
+    bool dueForFetch =
+        lastDataRefreshAt == 0 || millis() - lastDataRefreshAt >= DATA_REFRESH_INTERVAL_MS;
+    if (WiFi.status() == WL_CONNECTED && dueForFetch) {
+      fetchLiveData();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
-  Serial.println();
+}
 
-  if (WiFi.status() == WL_CONNECTED) {
+void connectWifi(bool forceSetupPortal) {
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+
+  WiFiManager wifiManager;
+  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_MS / 1000);
+  wifiManager.setConfigPortalTimeout(180);
+
+  bool connected;
+  if (forceSetupPortal) {
+    Serial.println("Opening WiFi setup portal (forced)...");
+    wifiManager.resetSettings();
+    connected = wifiManager.startConfigPortal(WIFI_SETUP_AP_NAME);
+  } else {
+    Serial.println("Connecting to saved WiFi, or opening setup portal if none saved...");
+    connected = wifiManager.autoConnect(WIFI_SETUP_AP_NAME);
+  }
+
+  if (connected) {
     Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("WiFi connect timeout");
+    Serial.println("WiFi connect/setup portal timed out");
   }
 }
 
@@ -518,21 +554,30 @@ void maintainWifi() {
   }
 
   lastWifiRetryAt = millis();
-  Serial.println("Retrying WiFi...");
+  Serial.println("Retrying WiFi with saved credentials...");
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin();
 }
 
-void maybeRefreshDepartures() {
-  if (WiFi.status() != WL_CONNECTED) {
+void checkForNewData() {
+  if (!dataDirty) {
     return;
   }
-  if (lastDataRefreshAt != 0 && millis() - lastDataRefreshAt < DATA_REFRESH_INTERVAL_MS) {
+  dataDirty = false;
+  lastAppliedElapsedMinutes = 0;
+  redrawDynamicPanels();
+}
+
+void updateCountdownIfNeeded() {
+  if (lastDataRefreshAt == 0) {
     return;
   }
-  if (fetchLiveData()) {
-    redrawDynamicPanels();
+  int elapsedMinutes = (int)((millis() - lastDataRefreshAt) / 60000);
+  if (elapsedMinutes == lastAppliedElapsedMinutes) {
+    return;
   }
+  lastAppliedElapsedMinutes = elapsedMinutes;
+  drawRows();
 }
 
 bool readTouchPoint(int16_t &x, int16_t &y) {
@@ -624,9 +669,16 @@ void setup() {
   touchSPI.begin(PIN_TOUCH_SCLK, PIN_TOUCH_MISO, PIN_TOUCH_MOSI, PIN_TOUCH_CS);
   touch.begin(touchSPI);
 
-  connectWifi();
+  bool forceWifiSetup = touch.touched();
+  if (forceWifiSetup) {
+    Serial.println("Touch held at boot: forcing WiFi setup portal");
+  }
+  connectWifi(forceWifiSetup);
+
+  dataMutex = xSemaphoreCreateMutex();
   fetchLiveData();
   renderScreen(true);
+  xTaskCreatePinnedToCore(fetchTaskLoop, "fetchTask", 8192, nullptr, 1, nullptr, 0);
 
   Serial.println("ESP32-2432S028 live departure monitor booted");
 }
@@ -636,5 +688,6 @@ void loop() {
   updateTicker();
   updateHeaderStatusIfNeeded();
   maintainWifi();
-  maybeRefreshDepartures();
+  checkForNewData();
+  updateCountdownIfNeeded();
 }

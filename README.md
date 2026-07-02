@@ -9,6 +9,8 @@ ESP32 firmware for a small touchscreen departure monitor that shows live VRR dep
 - Shows tram and U-Bahn departures in a simple touch-driven UI
 - Displays platform information and a scrolling live hint ticker
 - Lets you switch mode and direction by touching the screen
+- Refreshes departure data in the background, so the UI never freezes while fetching
+- Counts departure times down locally between refreshes, so minutes keep ticking down to `sofort` even if the network is briefly unavailable
 
 ## Hardware / Target
 
@@ -34,6 +36,7 @@ PlatformIO installs these automatically:
 - `TFT_eSPI`
 - `XPT2046_Touchscreen`
 - `ArduinoJson`
+- `WiFiManager`
 - ESP32 Arduino framework libraries such as `WiFi`, `HTTPClient`, and `WiFiClientSecure`
 
 ## Build And Flash
@@ -59,11 +62,19 @@ platformio run --target upload
 platformio device monitor
 ```
 
+## Wi-Fi Setup
+
+Wi-Fi credentials are no longer hardcoded in source. The firmware uses [WiFiManager](https://github.com/tzapu/WiFiManager) to let you pick any network from the device itself:
+
+- On first boot (or if no Wi-Fi is saved), the ESP32 opens a Wi-Fi access point called `HaltestelleMonitor-Setup`.
+- Connect to that AP from your phone or laptop; a setup portal lets you pick your network from a scan and enter its password.
+- Credentials are saved on-device and reused automatically on future boots.
+- To switch to a different network later, hold the touchscreen down while powering on the device — this forces the setup portal to reopen so you can choose a new network.
+
 ## Current Runtime Configuration
 
-The current firmware keeps a few settings directly in source:
+The current firmware still keeps a few settings directly in source:
 
-- Wi-Fi SSID and password
 - stop label and stop ID
 - VRR endpoint URL
 
@@ -73,6 +84,7 @@ These are defined near the top of [src/main.cpp](./src/main.cpp).
 
 - Tap the upper tab area to switch between `Strassenbahn` and `U-Bahn`
 - Tap the departures area to switch direction
+- Hold the touchscreen while powering on to reopen the Wi-Fi setup portal
 
 ## Visual Reference
 
@@ -92,13 +104,10 @@ The request is configured with:
 
 ## Known Limitations
 
-- The current refresh logic is synchronous, so the UI can briefly freeze while data is fetched and parsed.
-- Wi-Fi credentials are hardcoded in source.
 - The project is currently tailored to one specific stop and one specific display setup.
 
 ## Next Improvements
 
-- Move Wi-Fi and stop configuration into a separate config file or onboarding flow
-- Make live refresh non-blocking so the UI stays responsive during network requests
+- Move stop configuration into a separate config file or onboarding flow
 - Add support for multiple saved stops
 - Add real device photos or captured display screenshots to replace the current placeholder preview
