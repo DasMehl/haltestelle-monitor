@@ -2,6 +2,10 @@
 
 ESP32 firmware for a small touchscreen departure monitor that shows live VRR departures.
 
+**New here?** Follow [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) for a full
+walkthrough from a fresh board to a working monitor. Something not working? Check
+[docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md).
+
 ## What It Does
 
 - Connects an ESP32-based 320x240 touchscreen display to Wi-Fi, configured entirely on-device (no hardcoded credentials)
@@ -27,6 +31,8 @@ Configured display and touch pins are defined in:
 
 - [src/main.cpp](./src/main.cpp): main firmware, UI rendering, touch handling, Wi-Fi, and VRR fetching
 - [platformio.ini](./platformio.ini): PlatformIO environment, board config, library dependencies, display build flags
+- [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md): full setup walkthrough for new users
+- [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md): fixes for common setup/flashing issues
 - [docs/WIRING.md](./docs/WIRING.md): pin mapping and wiring notes
 - [docs/SCREENSHOTS.md](./docs/SCREENSHOTS.md): UI preview and screenshot placeholders
 
@@ -40,51 +46,19 @@ PlatformIO installs these automatically:
 - `WiFiManager`
 - ESP32 Arduino framework libraries such as `WiFi`, `HTTPClient`, and `WiFiClientSecure`
 
-## Build And Flash
+## Build, Flash, And Setup
 
-1. Install PlatformIO Core or open the project in VS Code with PlatformIO.
-2. Connect the ESP32 over USB.
-3. Adjust `upload_port` and `monitor_port` in [platformio.ini](./platformio.ini) if your serial device differs.
-4. Build:
+See [docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) for the full walkthrough,
+including the on-device Wi-Fi and Haltestelle (stop) setup wizard. Quick reference:
 
 ```bash
-platformio run
+platformio run                                        # build
+platformio run --target upload --upload-port <PORT>   # flash
+platformio device monitor --port <PORT>               # serial monitor
 ```
 
-5. Flash:
-
-```bash
-platformio run --target upload
-```
-
-6. Open serial monitor:
-
-```bash
-platformio device monitor
-```
-
-## Setup Wizard (Wi-Fi + Haltestelle)
-
-Setup is a two-step, on-device wizard. Nothing is hardcoded in source — both steps are gated so step 2 only becomes available once step 1 succeeds, and the TFT shows connection status at each step.
-
-### Step 1 — Wi-Fi
-
-The firmware uses [WiFiManager](https://github.com/tzapu/WiFiManager) to let you pick any network from the device itself:
-
-- On first boot (or if no Wi-Fi is saved), the ESP32 opens a Wi-Fi access point called `HaltestelleMonitor-Setup`.
-- Connect to that AP from your phone or laptop; a setup portal lets you pick your network from a scan and enter its password.
-- Credentials are saved on-device and reused automatically on future boots.
-- To switch to a different network later, hold the touchscreen down while powering on the device — this forces the setup portal to reopen so you can choose a new network.
-
-### Step 2 — Haltestelle (stop) selection
-
-Once Wi-Fi is connected, the firmware starts a small web server on the device for choosing your stops:
-
-- The TFT shows the address to visit once step 1 succeeds.
-- **Use the IP address shown on screen (e.g. `http://192.168.x.x`) — the `http://haltestelle.local` mDNS name is shown too, but doesn't reliably resolve from all phones (notably some Android devices), so the IP is the reliable fallback.**
-- The page has two independent sections — **Straßenbahn** and **U-Bahn** — since a tram stop and a U-Bahn stop for the same area often have different VRR stop IDs (most locations only have one or the other; having both is a coincidence, not the norm).
-- In either section, type part of a stop name and tap "Suchen" to search VRR's stop database; a list of matching stops appears, and tapping one saves it immediately for that mode.
-- This page stays available any time the device is connected to Wi-Fi (not just during initial setup), so you can revisit `http://<device-ip>/` any time to change either stop.
+If upload fails with `Wrong boot mode detected`, see
+[docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md).
 
 ## Touch Controls
 
