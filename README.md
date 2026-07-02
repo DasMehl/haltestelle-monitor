@@ -68,7 +68,11 @@ If upload fails with `Wrong boot mode detected`, see
 
 ## Visual Reference
 
-- [docs/SCREENSHOTS.md](./docs/SCREENSHOTS.md)
+<img src="./docs/screenshots/strassenbahn.png" alt="Strassenbahn tab" width="400"> <img src="./docs/screenshots/ubahn.png" alt="U-Bahn tab" width="400">
+
+Rendered to-scale mockups, not live device captures — see
+[docs/SCREENSHOTS.md](./docs/SCREENSHOTS.md) for details and to contribute real
+device photos.
 
 ## Data Source
 

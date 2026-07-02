@@ -1,36 +1,32 @@
 # Screenshots
 
-Real device photos are not in the repository yet. This page documents the intended on-screen layout so the repo still has a quick visual reference.
+Real device photos aren't in the repository yet (if you have one, contributions
+welcome — see the note at the bottom). In the meantime, the images below are
+rendered mockups: a to-scale reproduction of the exact colors, pixel positions,
+fonts, and text-truncation logic from the drawing functions in
+[src/main.cpp](../src/main.cpp), filled in with representative sample data. They
+are not a live capture of the firmware running, but they accurately reflect what
+it draws.
 
-## Current UI Layout
+## Strassenbahn Tab
 
-```text
-+--------------------------------------------------------------+
-| Steinstr./Koenigsallee                           Live / 1 Min |
-|                                                              |
-| [ Strassenbahn ]                         [ U-Bahn ]          |
-|                                                              |
-| Li     Ziel                                           Min    |
-|--------------------------------------------------------------|
-| 709    Neuss, Theodor-Heuss-Platz                        3    |
-| 708    Polizeipraesidium                                 5    |
-| 701    Rath                                              8    |
-| U78    MERKUR SPIEL-ARENA / Messe Nord                  10    |
-|--------------------------------------------------------------|
-| Live-Hinweis                                  Steig 2        |
-| Bauarbeiten / Hinweistext scrollt als Ticker unten         |
-+--------------------------------------------------------------+
-```
+![Strassenbahn tab showing four tram departures](./screenshots/strassenbahn.png)
+
+## U-Bahn Tab
+
+![U-Bahn tab showing four U-Bahn departures for a different configured stop](./screenshots/ubahn.png)
+
+Note how the header shows a different stop name in each tab — Straßenbahn and
+U-Bahn each have their own independently configured Haltestelle (see
+[GETTING_STARTED.md](./GETTING_STARTED.md)).
 
 ## Interaction
 
 - Touch the top tab area to switch between tram and U-Bahn
 - Touch the departure list area to toggle direction
 
-## Planned Replacement
+## Replacing These With Real Photos
 
-Replace this page later with:
-
-- one photo of the physical device
-- one straight-on screen shot of the live UI
-- optional close-up of the touch interaction areas
+If you have a working device, a straight-on photo of the screen (or a close-up of
+the touch interaction areas) is a welcome addition — just drop it in
+`docs/screenshots/` and update the references above.
