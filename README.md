@@ -18,11 +18,14 @@ Configured display and touch pins are defined in:
 
 - [platformio.ini](./platformio.ini)
 - [src/main.cpp](./src/main.cpp)
+- [docs/WIRING.md](./docs/WIRING.md)
 
 ## Project Structure
 
 - [src/main.cpp](./src/main.cpp): main firmware, UI rendering, touch handling, Wi-Fi, and VRR fetching
 - [platformio.ini](./platformio.ini): PlatformIO environment, board config, library dependencies, display build flags
+- [docs/WIRING.md](./docs/WIRING.md): pin mapping and wiring notes
+- [docs/SCREENSHOTS.md](./docs/SCREENSHOTS.md): UI preview and screenshot placeholders
 
 ## Dependencies
 
@@ -71,6 +74,10 @@ These are defined near the top of [src/main.cpp](./src/main.cpp).
 - Tap the upper tab area to switch between `Strassenbahn` and `U-Bahn`
 - Tap the departures area to switch direction
 
+## Visual Reference
+
+- [docs/SCREENSHOTS.md](./docs/SCREENSHOTS.md)
+
 ## Data Source
 
 The firmware fetches live data from:
@@ -94,4 +101,4 @@ The request is configured with:
 - Move Wi-Fi and stop configuration into a separate config file or onboarding flow
 - Make live refresh non-blocking so the UI stays responsive during network requests
 - Add support for multiple saved stops
-- Add screenshots and wiring notes to this repository
+- Add real device photos or captured display screenshots to replace the current placeholder preview
