@@ -42,7 +42,7 @@ constexpr uint16_t SCREEN_H = 240;
 
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
-constexpr uint32_t DATA_REFRESH_INTERVAL_MS = 60000;
+constexpr uint32_t DATA_REFRESH_INTERVAL_MS = 30000;
 constexpr uint32_t HEADER_REFRESH_INTERVAL_MS = 1000;
 constexpr uint32_t TICKER_FRAME_INTERVAL_MS = 45;
 
