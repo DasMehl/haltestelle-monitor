@@ -20,6 +20,19 @@ Note how the header shows a different stop name in each tab — Straßenbahn and
 U-Bahn each have their own independently configured Haltestelle (see
 [GETTING_STARTED.md](./GETTING_STARTED.md)).
 
+## Status Chip States
+
+The chip in the top-right corner sizes itself to its content and reflects data
+freshness:
+
+- **Green `Live`** — data was fetched within the last minute; the dot pulses.
+- **Amber `vor X Min`** — the last successful update is X minutes old. The
+  countdowns keep ticking down locally in the meantime, and departed trains
+  drop off the list on their own.
+
+An imminent departure shows a green `sofort` instead of a minute count (visible
+in the U-Bahn screenshot above).
+
 ## Interaction
 
 - Touch the top tab area to switch between tram and U-Bahn

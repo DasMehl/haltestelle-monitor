@@ -85,3 +85,20 @@ retrying on its own, or you can just try selecting the stop again.
 Departure data refreshes happen in the background and shouldn't block the UI. If you
 see a freeze during normal operation (not during setup), that's a regression — please
 report it with what you were doing right before it happened.
+
+### The status chip says "vor X Min" instead of "Live"
+
+The last successful data fetch is X minutes old. The device keeps counting departures
+down locally in the meantime (and drops trains off the list once they've departed), so
+the display stays useful. It also heals itself: after 5 minutes without a successful
+update it forces a Wi-Fi reconnect, and after 10 minutes it restarts entirely — the
+same thing a manual power cycle would do. If you see it restart on its own now and
+then, that's this watchdog doing its job; if it happens constantly, check whether the
+VRR endpoint is reachable from your network at all.
+
+### The device restarts by itself every 10 minutes
+
+That's the freshness watchdog (see above) firing repeatedly, which means no fetch ever
+succeeds. Likely causes: the network blocks plain-HTTP traffic (some guest/corporate
+networks do), or the VRR open-data endpoint is down. Check the serial monitor output
+for the exact fetch errors.

@@ -10,12 +10,13 @@ walkthrough from a fresh board to a working monitor. Something not working? Chec
 
 - Connects an ESP32-based 320x240 touchscreen display to Wi-Fi, configured entirely on-device (no hardcoded credentials)
 - Lets you search VRR's stop database by name and pick your own Straßenbahn and U-Bahn stops from a web page, independently of each other
-- Fetches live departure data from the VRR departure monitor endpoint for each configured stop
-- Shows tram and U-Bahn departures in a simple touch-driven UI
+- Fetches live departure data from the VRR departure monitor endpoint for each configured stop, every 30 seconds
+- Shows tram and U-Bahn departures in a clean dark UI: proportional FreeSans typography, segmented mode tabs, line-number chips, and a status chip that shows `Live` (green) or `vor X Min` (amber) depending on data freshness
 - Displays platform information and a scrolling live hint ticker
 - Lets you switch mode and direction by touching the screen
-- Refreshes departure data in the background, so the UI never freezes while fetching
-- Counts departure times down locally between refreshes, so minutes keep ticking down to `sofort` even if the network is briefly unavailable
+- Refreshes departure data in a background task, so the UI never freezes while fetching
+- Counts departure times down locally between refreshes: minutes tick down to `sofort`, and a departed train drops off the list a minute later with the next one shifting up — so the display keeps predicting sensibly even without fresh data
+- Heals itself: if no update succeeds for 5 minutes it forces a Wi-Fi reconnect, and after 10 minutes it restarts — so it never sits showing hours-old departures
 
 ## Hardware / Target
 
@@ -44,7 +45,7 @@ PlatformIO installs these automatically:
 - `XPT2046_Touchscreen`
 - `ArduinoJson`
 - `WiFiManager`
-- ESP32 Arduino framework libraries such as `WiFi`, `HTTPClient`, and `WiFiClientSecure`
+- ESP32 Arduino framework libraries such as `WiFi`, `HTTPClient`, `WebServer`, and `ESPmDNS`
 
 ## Build, Flash, And Setup
 
@@ -78,8 +79,10 @@ device photos.
 
 The firmware talks to two VRR open-data endpoints:
 
-- `https://openservice-test.vrr.de/static03/XML_DM_REQUEST` — live departures for a configured stop ID, with `useRealtime=1` and JSON output.
-- `https://openservice-test.vrr.de/static03/XML_STOPFINDER_REQUEST` — stop name search (used by the Haltestelle web page), returning candidate stop IDs and names for a typed query.
+- `http://openservice-test.vrr.de/static03/XML_DM_REQUEST` — live departures for a configured stop ID, with `useRealtime=1`, JSON output, `limit=20`, and a transport-mode filter (`includedMeans` restricted to U-Bahn and tram) so the result slots aren't wasted on buses and trains.
+- `http://openservice-test.vrr.de/static03/XML_STOPFINDER_REQUEST` — stop name search (used by the Haltestelle web page), returning candidate stop IDs and names for a typed query.
+
+Requests are made over plain HTTP deliberately: the data is public with no credentials involved, and TLS on the ESP32 proved both fragile for these response sizes and expensive (~45KB of heap per connection). Responses are parsed with an [ArduinoJson filter](https://arduinojson.org/v7/api/json/deserializejson/) so only the handful of fields the display uses are ever kept in memory.
 
 ## Known Limitations
 
