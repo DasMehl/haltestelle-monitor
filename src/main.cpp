@@ -7,7 +7,6 @@
 #include <TFT_eSPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <XPT2046_Touchscreen.h>
 #include <freertos/FreeRTOS.h>
@@ -25,9 +24,12 @@ constexpr uint8_t PIN_TOUCH_SCLK = 25;
 constexpr const char *WIFI_SETUP_AP_NAME = "HaltestelleMonitor-Setup";
 constexpr const char *DEFAULT_STOP_LABEL = "Steinstr./Koenigsallee";
 constexpr const char *DEFAULT_STOP_ID = "20018234";
-constexpr const char *VRR_DM_URL = "https://openservice-test.vrr.de/static03/XML_DM_REQUEST";
+// Plain HTTP on purpose: the data is public, no credentials are involved, and
+// mbedtls-over-802.11 proved fragile for these ~100KB bodies (frequent
+// mid-stream aborts) while costing ~45KB of heap per connection.
+constexpr const char *VRR_DM_URL = "http://openservice-test.vrr.de/static03/XML_DM_REQUEST";
 constexpr const char *VRR_STOPFINDER_URL =
-    "https://openservice-test.vrr.de/static03/XML_STOPFINDER_REQUEST";
+    "http://openservice-test.vrr.de/static03/XML_STOPFINDER_REQUEST";
 
 constexpr const char *PORTAL_CUSTOM_CSS =
     "<style>"
@@ -43,18 +45,32 @@ constexpr uint16_t SCREEN_H = 240;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr uint32_t DATA_REFRESH_INTERVAL_MS = 30000;
+constexpr uint32_t FETCH_RETRY_INTERVAL_MS = 10000;
 constexpr uint32_t HEADER_REFRESH_INTERVAL_MS = 1000;
 constexpr uint32_t TICKER_FRAME_INTERVAL_MS = 45;
+constexpr uint32_t STALE_WIFI_RECONNECT_MS = 5 * 60 * 1000;
+constexpr uint32_t STALE_REBOOT_MS = 10 * 60 * 1000;
 
-constexpr uint16_t COLOR_BG = TFT_BLACK;
-constexpr uint16_t COLOR_PANEL = 0x10A2;
-constexpr uint16_t COLOR_PANEL_SOFT = 0x18E4;
-constexpr uint16_t COLOR_BORDER = 0x31A6;
-constexpr uint16_t COLOR_TEXT = 0xEF7D;
-constexpr uint16_t COLOR_MUTED = 0x7BEF;
-constexpr uint16_t COLOR_TRAM = 0xFEE0;
-constexpr uint16_t COLOR_UBAHN = 0x44BF;
-constexpr uint16_t COLOR_WARN = 0xFDF0;
+constexpr int STORED_ROWS = 6;
+constexpr int DISPLAY_ROWS = 4;
+
+// Font "number" that selects the currently set GFX free font in drawString;
+// same convention as TFT_eSPI's Free_Fonts.h example header.
+constexpr uint8_t GFXFF = 1;
+
+// RGB565 palette; comments give the approximate RGB888 source values.
+constexpr uint16_t COLOR_BG = 0x0841;         // deep blue-black (8,10,14)
+constexpr uint16_t COLOR_PANEL = 0x10C4;      // (22,26,34)
+constexpr uint16_t COLOR_PANEL_SOFT = 0x2126; // (32,38,48)
+constexpr uint16_t COLOR_BORDER = 0x31E9;     // (52,60,74)
+constexpr uint16_t COLOR_SEPARATOR = 0x2146;  // (36,42,52)
+constexpr uint16_t COLOR_TEXT = 0xEF7E;       // (235,238,242)
+constexpr uint16_t COLOR_MUTED = 0x8CB4;      // (140,150,165)
+constexpr uint16_t COLOR_TRAM = 0xFE60;       // (255,205,0)
+constexpr uint16_t COLOR_UBAHN = 0x44DF;      // (68,153,255)
+constexpr uint16_t COLOR_LIVE = 0x2E6E;       // (46,204,113)
+constexpr uint16_t COLOR_STALE = 0xFD47;      // amber (255,170,56)
+constexpr uint16_t COLOR_HINT_DOT = 0xFDA5;   // (255,180,40)
 
 struct Departure {
   char line[8];
@@ -66,7 +82,7 @@ struct Departure {
 struct DirectionView {
   char platformLabel[20];
   char liveHint[180];
-  Departure rows[4];
+  Departure rows[STORED_ROWS];
 };
 
 struct ModeView {
@@ -92,6 +108,7 @@ uint32_t lastHeaderRefreshAt = 0;
 uint32_t lastTickerShiftAt = 0;
 uint32_t lastWifiRetryAt = 0;
 uint32_t lastDataRefreshAt = 0;
+uint32_t lastFetchAttemptAt = 0;
 uint32_t stopChangeRequestedAt = 0;
 int lastAppliedElapsedMinutes = -1;
 
@@ -121,9 +138,8 @@ struct Rect {
   int16_t h;
 };
 
-Rect modeTapArea{0, 0, 320, 72};
-Rect tableArea{8, 78, 304, 154};
-Rect departuresTapArea{8, 78, 304, 154};
+Rect modeTapArea{0, 0, 320, 68};
+Rect departuresTapArea{0, 68, 320, 134};
 
 bool pointInRect(int16_t x, int16_t y, const Rect &rect) {
   return x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h;
@@ -215,6 +231,7 @@ DirectionView snapshotActiveView() {
 void drawSetupStatus(const char *line1, const char *line2 = nullptr, const char *line3 = nullptr,
                       const char *line4 = nullptr) {
   tft.fillScreen(COLOR_BG);
+  tft.setTextFont(1);
   tft.setTextDatum(MC_DATUM);
   int y = SCREEN_H / 2 - 30;
   const char *lines[4] = {line1, line2, line3, line4};
@@ -228,169 +245,203 @@ void drawSetupStatus(const char *line1, const char *line2 = nullptr, const char 
   }
 }
 
-void drawRoundedPanel(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t fill) {
-  tft.fillRoundRect(x, y, w, h, 10, fill);
-  tft.drawRoundRect(x, y, w, h, 10, COLOR_BORDER);
-}
-
 void drawHeaderStatus() {
   char stamp[20];
   uint32_t ageMs = lastUpdateAt == 0 ? UINT32_MAX : millis() - lastUpdateAt;
-  bool showLive = false;
+  bool fresh = false;
   if (lastUpdateAt == 0) {
     copyText(stamp, sizeof(stamp), "vor -- Min");
   } else {
     uint32_t ageMinutes = ageMs / 60000;
     if (ageMinutes == 0) {
       copyText(stamp, sizeof(stamp), "Live");
-      showLive = true;
+      fresh = true;
     } else {
       snprintf(stamp, sizeof(stamp), "vor %lu Min", ageMinutes);
     }
   }
 
-  constexpr int statusRight = 314;
-  constexpr int statusY = 13;
-  constexpr int dotX = 244;
-  constexpr int stampRight = 312;
-  tft.fillRect(232, 4, 82, 18, COLOR_BG);
-  uint16_t dotColor = COLOR_MUTED;
-  if (ageMs < DATA_REFRESH_INTERVAL_MS * 2) {
+  uint16_t stateColor = COLOR_STALE;
+  if (fresh) {
     uint32_t phase = millis() % 1600;
     uint8_t pulse = phase < 800 ? (phase * 255) / 800 : ((1600 - phase) * 255) / 800;
-    uint8_t g = 90 + (pulse * 165 / 255);
-    dotColor = tft.color565(20, g, 60);
+    uint8_t g = 120 + (pulse * 84 / 255);
+    stateColor = tft.color565(30, g, 90);
   }
-  tft.fillCircle(dotX, statusY, 4, dotColor);
-  tft.setTextColor(COLOR_MUTED, COLOR_BG);
-  tft.setTextDatum(TR_DATUM);
-  if (showLive) {
-    tft.drawString("Live", statusRight, statusY, 1);
-  } else {
-    tft.drawString(stamp, stampRight, statusY, 1);
-  }
+
+  // Chip is right-anchored and sized to its content: pad + dot + gap + text
+  // + pad, so "Live" sits centered and longer stale text grows leftward.
+  // setTextFont(1) clears any active free font, otherwise "font 1" would
+  // render the free font instead of the small 8px system font.
+  tft.setTextFont(1);
+  constexpr int chipRight = 308;
+  constexpr int chipTop = 6;
+  constexpr int chipH = 18;
+  int textW = tft.textWidth(stamp, 1);
+  int chipW = 7 + 6 + 5 + textW + 7;
+  int chipLeft = chipRight - chipW;
+
+  tft.fillRect(chipRight - 104, chipTop - 2, 108, chipH + 4, COLOR_BG);
+  tft.drawRoundRect(chipLeft, chipTop, chipW, chipH, 9, stateColor);
+  tft.fillCircle(chipLeft + 10, chipTop + chipH / 2, 3, stateColor);
+  tft.setTextColor(stateColor, COLOR_BG);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(stamp, chipLeft + 18, chipTop + chipH / 2 + 1, 1);
 }
 
 void drawHeader() {
   const char *activeStopLabel = activeMode == 0 ? tramStopLabel : ubahnStopLabel;
-  tft.setTextColor(COLOR_TEXT, COLOR_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.fillRect(0, 0, SCREEN_W, 28, COLOR_BG);
+  tft.fillRect(0, 0, SCREEN_W, 34, COLOR_BG);
 
-  constexpr int labelMaxWidth = 214;
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  constexpr int labelMaxWidth = 196;
   String label = activeStopLabel;
-  while (label.length() > 0 && tft.textWidth(label + "...", 2) > labelMaxWidth) {
+  while (label.length() > 0 && tft.textWidth(label + "...", GFXFF) > labelMaxWidth) {
     label.remove(label.length() - 1);
   }
   if (label != activeStopLabel) {
     label += "...";
   }
 
-  tft.drawString(label, 10, 10, 2);
-  tft.drawString(label, 11, 10, 2);
-  tft.drawString(label, 10, 11, 2);
-  tft.drawString(label, 11, 11, 2);
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(label, 12, 8, GFXFF);
+  tft.drawFastHLine(12, 31, 296, COLOR_BORDER);
   drawHeaderStatus();
 }
 
 void drawTabs() {
-  auto drawTab = [](int x, const char *label, bool active, uint16_t color) {
-    uint16_t fill = active ? color : COLOR_PANEL_SOFT;
-    uint16_t text = active ? COLOR_BG : COLOR_TEXT;
-    tft.fillRoundRect(x, 34, 148, 34, 12, fill);
-    tft.drawRoundRect(x, 34, 148, 34, 12, COLOR_BORDER);
-    tft.setTextColor(text, fill);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(label, x + 74, 52, 2);
-  };
+  uint16_t activeColor = activeMode == 0 ? COLOR_TRAM : COLOR_UBAHN;
+  tft.fillRoundRect(12, 38, 296, 28, 14, COLOR_PANEL_SOFT);
+  if (activeMode == 0) {
+    tft.fillRoundRect(14, 40, 146, 24, 12, activeColor);
+  } else {
+    tft.fillRoundRect(160, 40, 146, 24, 12, activeColor);
+  }
 
-  drawTab(8, "Strassenbahn", activeMode == 0, COLOR_TRAM);
-  drawTab(164, "U-Bahn", activeMode == 1, COLOR_UBAHN);
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(activeMode == 0 ? COLOR_BG : COLOR_MUTED,
+                   activeMode == 0 ? activeColor : COLOR_PANEL_SOFT);
+  tft.drawString("Strassenbahn", 87, 53, GFXFF);
+  tft.setTextColor(activeMode == 1 ? COLOR_BG : COLOR_MUTED,
+                   activeMode == 1 ? activeColor : COLOR_PANEL_SOFT);
+  tft.drawString("U-Bahn", 234, 53, GFXFF);
 }
 
 void drawRows() {
   DirectionView view = snapshotActiveView();
   uint32_t elapsedMinutes = lastDataRefreshAt == 0 ? 0 : (millis() - lastDataRefreshAt) / 60000;
-  drawRoundedPanel(tableArea.x, tableArea.y, tableArea.w, tableArea.h, COLOR_PANEL);
+  tft.fillRect(0, 68, SCREEN_W, 134, COLOR_BG);
 
-  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+  tft.setTextFont(1);
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString("Li", 18, 84, 1);
-  tft.drawString("Ziel", 74, 84, 1);
-  tft.drawString("Min", 274, 84, 1);
+  tft.drawString("ABFAHRTEN", 12, 74, 1);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(view.platformLabel, 308, 74, 1);
 
-  constexpr int rowTop = 94;
-  constexpr int rowHeight = 18;
-  constexpr int rowGap = 5;
-  for (int i = 0; i < 4; ++i) {
-    int y = rowTop + i * (rowHeight + rowGap);
+  // Drop trains that are more than a minute past "sofort" so stale data keeps
+  // predicting: a departed train disappears and the next stored one shifts up,
+  // even when no fresh fetch has arrived.
+  Departure displayRows[DISPLAY_ROWS];
+  int displayMinutes[DISPLAY_ROWS];
+  int shown = 0;
+  for (const Departure &stored : view.rows) {
+    if (shown >= DISPLAY_ROWS) {
+      break;
+    }
+    if (!stored.valid) {
+      continue;
+    }
+    int liveMinutes = stored.minutesAtFetch - (int)elapsedMinutes;
+    if (liveMinutes < 0) {
+      continue;
+    }
+    displayRows[shown] = stored;
+    displayMinutes[shown] = liveMinutes;
+    ++shown;
+  }
+
+  uint16_t chipColor = activeMode == 0 ? COLOR_TRAM : COLOR_UBAHN;
+  constexpr int rowTop = 90;
+  constexpr int rowStride = 28;
+  for (int i = 0; i < DISPLAY_ROWS; ++i) {
+    int y = rowTop + i * rowStride;
     if (i > 0) {
-      tft.drawFastHLine(16, y - 3, 288, COLOR_BORDER);
+      tft.drawFastHLine(12, y - 5, 296, COLOR_SEPARATOR);
+    }
+    if (i >= shown) {
+      continue;
     }
 
-    const Departure &row = view.rows[i];
-    int liveMinutes = row.valid ? max(0, row.minutesAtFetch - (int)elapsedMinutes) : -1;
-    uint16_t chipColor = activeMode == 0 ? COLOR_TRAM : COLOR_UBAHN;
-    tft.fillRoundRect(14, y, 44, 18, 6, chipColor);
+    const Departure &row = displayRows[i];
+    int liveMinutes = displayMinutes[i];
+
+    // Bitmap font 2 digits center exactly within the chip; the FreeSans
+    // glyphs used previously overflowed its corners.
+    tft.fillRoundRect(12, y, 42, 20, 10, chipColor);
     tft.setTextColor(COLOR_BG, chipColor);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString(row.line, 36, y + 9, 2);
+    tft.drawString(row.line, 33, y + 10, 2);
 
-    tft.setTextColor(COLOR_TEXT, COLOR_PANEL);
-    tft.setTextDatum(TL_DATUM);
-    char minutesLabel[8] = "";
-    int minutesFont = 4;
-    if (row.valid) {
-      if (liveMinutes <= 0) {
-        copyText(minutesLabel, sizeof(minutesLabel), "sofort");
-        minutesFont = 2;
-      } else {
-        snprintf(minutesLabel, sizeof(minutesLabel), "%d", liveMinutes);
-      }
+    int destRight;
+    if (liveMinutes <= 0) {
+      tft.setFreeFont(&FreeSans9pt7b);
+      tft.setTextColor(COLOR_LIVE, COLOR_BG);
+      tft.setTextDatum(TR_DATUM);
+      tft.drawString("sofort", 308, y + 2, GFXFF);
+      destRight = 308 - tft.textWidth("sofort", GFXFF) - 8;
+    } else {
+      char minutesLabel[8];
+      snprintf(minutesLabel, sizeof(minutesLabel), "%d", liveMinutes);
+      tft.setTextFont(1);
+      int suffixW = tft.textWidth("min", 1);
+      tft.setTextColor(COLOR_MUTED, COLOR_BG);
+      tft.setTextDatum(TR_DATUM);
+      tft.drawString("min", 308, y + 10, 1);
+      tft.setFreeFont(&FreeSansBold12pt7b);
+      tft.setTextColor(COLOR_TEXT, COLOR_BG);
+      tft.drawString(minutesLabel, 308 - suffixW - 3, y + 1, GFXFF);
+      destRight = 308 - suffixW - 3 - tft.textWidth(minutesLabel, GFXFF) - 8;
     }
 
-    int minutesWidth = row.valid ? tft.textWidth(minutesLabel, minutesFont) : 0;
-    int destLeft = 68;
-    int destRight = row.valid ? (296 - minutesWidth - 10) : 296;
+    tft.setFreeFont(&FreeSans9pt7b);
+    constexpr int destLeft = 64;
     int destWidth = max(12, destRight - destLeft);
     String destText = row.destination;
-    while (destText.length() > 0 && tft.textWidth(destText + "...", 2) > destWidth) {
+    while (destText.length() > 0 && tft.textWidth(destText + "...", GFXFF) > destWidth) {
       destText.remove(destText.length() - 1);
     }
     if (destText != row.destination) {
       destText += "...";
     }
-    tft.drawString(destText, destLeft, y + 3, 2);
-
-    if (row.valid) {
-      tft.setTextDatum(TR_DATUM);
-      tft.drawString(minutesLabel, 296, y - 1, minutesFont);
-    }
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(destText, destLeft, y + 2, GFXFF);
   }
-
-  tft.drawFastHLine(16, 188, 288, COLOR_BORDER);
-  tft.setTextColor(COLOR_WARN, COLOR_PANEL);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawString("Live-Hinweis", 16, 198, 1);
-  tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(view.platformLabel, 296, 198, 1);
 }
 
-void drawFooter() {
+void drawTicker() {
   DirectionView view = snapshotActiveView();
   int textWidth = tickerSprite.textWidth(view.liveHint, 2);
   int loopWidth = max(1, textWidth + 24);
   int textX = -(tickerOffset % loopWidth);
 
   tickerSprite.fillSprite(COLOR_PANEL);
-  tickerSprite.setTextColor(COLOR_TEXT, COLOR_PANEL);
+  tickerSprite.setTextColor(COLOR_MUTED, COLOR_PANEL);
   tickerSprite.setTextDatum(TL_DATUM);
   tickerSprite.drawString(view.liveHint, textX, 0, 2);
-  if (textX + textWidth < 288) {
+  if (textX + textWidth < 264) {
     tickerSprite.drawString(view.liveHint, textX + loopWidth, 0, 2);
   }
-  tickerSprite.pushSprite(16, 212);
+  tickerSprite.pushSprite(34, 210);
+}
+
+void drawFooter() {
+  tft.fillRoundRect(12, 206, 296, 24, 12, COLOR_PANEL);
+  tft.fillCircle(24, 218, 3, COLOR_HINT_DOT);
+  drawTicker();
 }
 
 void redrawDynamicPanels() {
@@ -474,7 +525,7 @@ bool appendDeparture(DirectionView &view, JsonVariantConst departure) {
   candidate.valid = true;
 
   int insertAt = -1;
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < STORED_ROWS; ++i) {
     if (!view.rows[i].valid || candidate.minutesAtFetch < view.rows[i].minutesAtFetch) {
       insertAt = i;
       break;
@@ -482,7 +533,7 @@ bool appendDeparture(DirectionView &view, JsonVariantConst departure) {
   }
 
   if (insertAt >= 0) {
-    for (int i = 3; i > insertAt; --i) {
+    for (int i = STORED_ROWS - 1; i > insertAt; --i) {
       view.rows[i] = view.rows[i - 1];
     }
     view.rows[insertAt] = candidate;
@@ -515,6 +566,64 @@ bool appendDeparture(DirectionView &view, JsonVariantConst departure) {
   return insertAt >= 0;
 }
 
+// Reader for ArduinoJson that yields the CPU while waiting for network data.
+// Plain WiFiClient::read() returns immediately when the RX buffer is empty,
+// so parsing straight from the stream busy-spins during transfer gaps; on
+// core 0 that starves the idle task and trips the task watchdog (device
+// reboot). vTaskDelay in the wait loop keeps the watchdog fed.
+class YieldingReader {
+ public:
+  YieldingReader(WiFiClient &client, uint32_t gapTimeoutMs)
+      : client_(client), gapTimeoutMs_(gapTimeoutMs) {}
+
+  int read() {
+    uint32_t waitStart = millis();
+    for (;;) {
+      int c = client_.read();
+      if (c >= 0) {
+        return c;
+      }
+      if (!client_.connected() && client_.available() == 0) {
+        return -1;
+      }
+      if (millis() - waitStart >= gapTimeoutMs_) {
+        return -1;
+      }
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+
+  size_t readBytes(char *buffer, size_t length) {
+    size_t count = 0;
+    uint32_t waitStart = millis();
+    while (count < length) {
+      int avail = client_.available();
+      if (avail > 0) {
+        size_t want = length - count;
+        int n = client_.read(reinterpret_cast<uint8_t *>(buffer) + count,
+                             want < (size_t)avail ? want : (size_t)avail);
+        if (n > 0) {
+          count += n;
+          waitStart = millis();
+          continue;
+        }
+      }
+      if (!client_.connected() && client_.available() == 0) {
+        break;
+      }
+      if (millis() - waitStart >= gapTimeoutMs_) {
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return count;
+  }
+
+ private:
+  WiFiClient &client_;
+  uint32_t gapTimeoutMs_;
+};
+
 bool fetchStopDepartures(const char *stopIdForRequest, int modeIndex) {
   if (!stopIdForRequest[0]) {
     return false;
@@ -522,14 +631,17 @@ bool fetchStopDepartures(const char *stopIdForRequest, int modeIndex) {
 
   MutexGuard networkLock(networkMutex);
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  WiFiClient client;
 
   HTTPClient http;
+  // includedMeans restricts the response to U-Bahn (MOT 2) and tram (MOT 4)
+  // departures, so buses and trains don't eat up the limited result slots.
   String url = String(VRR_DM_URL) +
                "?language=de&outputFormat=JSON&coordOutputFormat=WGS84%5BDD.ddddd%5D"
                "&type_dm=stop&name_dm=" +
-               stopIdForRequest + "&mode=direct&useRealtime=1&limit=40";
+               stopIdForRequest +
+               "&mode=direct&useRealtime=1&limit=20"
+               "&includedMeans=checkbox&inclMOT_2=1&inclMOT_4=1";
 
   http.useHTTP10(true);
   http.setTimeout(15000);
@@ -547,8 +659,25 @@ bool fetchStopDepartures(const char *stopIdForRequest, int modeIndex) {
     return false;
   }
 
-  DynamicJsonDocument doc(98304);
-  DeserializationError error = deserializeJson(doc, *http.getStreamPtr());
+  // The full VRR response is ~150KB, which overflowed the old fixed parse
+  // buffer and made parsing fragile. Filter down to only the fields we read
+  // so the parsed document stays a few KB regardless of response size.
+  JsonDocument filter;
+  filter["dm"]["points"]["point"]["infos"] = true;
+  JsonObject departureFilter = filter["departureList"].add<JsonObject>();
+  departureFilter["countdown"] = true;
+  departureFilter["platform"] = true;
+  departureFilter["platformName"] = true;
+  departureFilter["lineInfos"] = true;
+  departureFilter["servingLine"]["number"] = true;
+  departureFilter["servingLine"]["motType"] = true;
+  departureFilter["servingLine"]["direction"] = true;
+  departureFilter["servingLine"]["liErgRiProj"]["direction"] = true;
+
+  JsonDocument doc;
+  YieldingReader reader(*http.getStreamPtr(), 10000);
+  DeserializationError error =
+      deserializeJson(doc, reader, DeserializationOption::Filter(filter));
   int contentLength = http.getSize();
   http.end();
   if (error) {
@@ -607,8 +736,8 @@ bool fetchLiveData() {
   xSemaphoreGive(dataMutex);
 
   dataDirty = true;
-  Serial.printf("Live departure data updated (tram=%s, ubahn=%s)\n", tramOk ? "ok" : "fail",
-                ubahnOk ? "ok" : "fail");
+  Serial.printf("Live departure data updated (tram=%s, ubahn=%s, heap=%u)\n",
+                tramOk ? "ok" : "fail", ubahnOk ? "ok" : "fail", ESP.getFreeHeap());
   return true;
 }
 
@@ -641,8 +770,7 @@ int searchStops(const char *query, StopCandidate *results, int maxResults) {
 
   MutexGuard networkLock(networkMutex);
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  WiFiClient client;
 
   HTTPClient http;
   String url = String(VRR_STOPFINDER_URL) +
@@ -665,8 +793,9 @@ int searchStops(const char *query, StopCandidate *results, int maxResults) {
     return 0;
   }
 
-  DynamicJsonDocument doc(16384);
-  DeserializationError error = deserializeJson(doc, *http.getStreamPtr());
+  JsonDocument doc;
+  YieldingReader reader(*http.getStreamPtr(), 10000);
+  DeserializationError error = deserializeJson(doc, reader);
   http.end();
   if (error) {
     Serial.printf("Stop search: JSON parse failed: %s\n", error.c_str());
@@ -846,7 +975,7 @@ void handleStopSet() {
     // the actual network fetch happens on fetchTaskLoop's core, not this
     // request handler, so the UI never freezes while it runs.
     stopChangeRequestedAt = millis();
-    lastDataRefreshAt = 0;
+    lastFetchAttemptAt = 0;
 
     stopServer.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
   } else {
@@ -876,11 +1005,17 @@ void startStopServer() {
 }
 
 void fetchTaskLoop(void *) {
+  bool lastFetchOk = true;
   for (;;) {
-    bool dueForFetch =
-        lastDataRefreshAt == 0 || millis() - lastDataRefreshAt >= DATA_REFRESH_INTERVAL_MS;
+    // Gate on the last *attempt*, not the last success, so a failing fetch
+    // can't retry every second and hammer VRR's server. After a failure the
+    // next try comes sooner than the normal interval so stale data recovers
+    // quickly, but still with enough spacing to stay polite.
+    uint32_t waitMs = lastFetchOk ? DATA_REFRESH_INTERVAL_MS : FETCH_RETRY_INTERVAL_MS;
+    bool dueForFetch = lastFetchAttemptAt == 0 || millis() - lastFetchAttemptAt >= waitMs;
     if (WiFi.status() == WL_CONNECTED && dueForFetch) {
-      fetchLiveData();
+      lastFetchAttemptAt = millis();
+      lastFetchOk = fetchLiveData();
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -923,6 +1058,33 @@ void maintainWifi() {
 
   lastWifiRetryAt = millis();
   Serial.println("Retrying WiFi with saved credentials...");
+  WiFi.disconnect();
+  WiFi.begin();
+}
+
+// Self-healing for the "connected but broken" state: WiFi reports connected
+// yet no fetch has succeeded for a long time (stale sockets, exhausted heap,
+// half-dead AP association). A reboot is known to fix it, so do that
+// automatically instead of showing hours-old departures.
+void maintainFreshness() {
+  uint32_t sinceSuccess = millis() - lastUpdateAt;  // lastUpdateAt==0 -> since boot
+  if (sinceSuccess < STALE_WIFI_RECONNECT_MS) {
+    return;
+  }
+
+  if (sinceSuccess >= STALE_REBOOT_MS) {
+    Serial.printf("No successful update for %lu min, restarting device\n",
+                  STALE_REBOOT_MS / 60000);
+    ESP.restart();
+  }
+
+  static uint32_t lastStaleReconnectAt = 0;
+  if (millis() - lastStaleReconnectAt < STALE_WIFI_RECONNECT_MS) {
+    return;
+  }
+  lastStaleReconnectAt = millis();
+  Serial.printf("No successful update for %lu min, forcing WiFi reconnect (heap=%u)\n",
+                sinceSuccess / 60000, ESP.getFreeHeap());
   WiFi.disconnect();
   WiFi.begin();
 }
@@ -1003,7 +1165,7 @@ void updateTicker() {
 
   lastTickerShiftAt = millis();
   tickerOffset += 1;
-  drawFooter();
+  drawTicker();
 }
 
 void updateHeaderStatusIfNeeded() {
@@ -1033,7 +1195,7 @@ void setup() {
   tft.fillScreen(COLOR_BG);
 
   tickerSprite.setColorDepth(16);
-  tickerSprite.createSprite(288, 16);
+  tickerSprite.createSprite(264, 16);
 
   touchSPI.begin(PIN_TOUCH_SCLK, PIN_TOUCH_MISO, PIN_TOUCH_MOSI, PIN_TOUCH_CS);
   touch.begin(touchSPI);
@@ -1073,6 +1235,7 @@ void loop() {
   updateTicker();
   updateHeaderStatusIfNeeded();
   maintainWifi();
+  maintainFreshness();
   checkForNewData();
   updateCountdownIfNeeded();
   if (stopServerRunning) {
