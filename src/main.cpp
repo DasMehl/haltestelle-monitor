@@ -321,12 +321,15 @@ void drawTabs() {
 
   tft.setFreeFont(&FreeSansBold9pt7b);
   tft.setTextDatum(MC_DATUM);
+  // Drawn slightly above the segments' geometric center (y=52): MC_DATUM
+  // centers the font's full line box, whose empty descender space pushes
+  // descender-less labels like these visibly downward.
   tft.setTextColor(activeMode == 0 ? COLOR_BG : COLOR_MUTED,
                    activeMode == 0 ? activeColor : COLOR_PANEL_SOFT);
-  tft.drawString("Strassenbahn", 87, 53, GFXFF);
+  tft.drawString("Strassenbahn", 87, 50, GFXFF);
   tft.setTextColor(activeMode == 1 ? COLOR_BG : COLOR_MUTED,
                    activeMode == 1 ? activeColor : COLOR_PANEL_SOFT);
-  tft.drawString("U-Bahn", 234, 53, GFXFF);
+  tft.drawString("U-Bahn", 234, 50, GFXFF);
 }
 
 void drawRows() {
