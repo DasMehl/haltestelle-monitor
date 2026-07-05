@@ -953,6 +953,14 @@ void handleStopSet() {
   id.trim();
   label.trim();
 
+  // VRR names stops as "City, Stop". The web page shows the full name so the
+  // right city can be picked, but the 320px header can't fit both, and the
+  // city is already known at selection time — keep only the stop part.
+  int citySep = label.indexOf(", ");
+  if (citySep >= 0 && citySep + 2 < (int)label.length()) {
+    label = label.substring(citySep + 2);
+  }
+
   bool ok = id.length() > 0 && (mode == "tram" || mode == "ubahn");
   if (ok) {
     int modeIndex = mode == "tram" ? 0 : 1;
